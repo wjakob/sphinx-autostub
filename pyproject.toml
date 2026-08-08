@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sphinx-autostub"
+dynamic = ["version"]
+description = "Generate a Sphinx API reference from PEP 561 type stubs"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "Wenzel Jakob", email = "wenzel.jakob@epfl.ch" }]
+dependencies = ["sphinx>=7.2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Sphinx :: Extension",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Documentation :: Sphinx",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/wjakob/sphinx-autostub"
+
+[project.scripts]
+sphinx-autostub = "sphinx_autostub.__main__:main"
+
+[tool.hatch.version]
+path = "src/sphinx_autostub/__init__.py"
