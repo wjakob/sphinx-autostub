@@ -88,6 +88,7 @@ function. The individual building blocks:
 
    Renderer(exclude: str | list[str] | Callable[[str], bool] | None = None,
             docstring_filter: Callable[[str], str] | None = None,
+            annotation_filter: Callable[[str], str] | None = None,
             style: str = 'google')
 
 A ``Renderer`` turns stub declarations into reStructuredText. Its
@@ -103,6 +104,14 @@ interpreted.
 - ``docstring_filter``: a function that receives each raw docstring after
   dedenting and returns a replacement, e.g. to drop a section that only
   makes sense in another context. The default keeps docstrings unchanged.
+- ``annotation_filter``: a function that receives each type expression as
+  text and returns a replacement. It sees parameter and return annotations,
+  the type of a property, attribute or module-level variable, and the
+  target of a type alias, one at a time, which keeps it away from parameter
+  names and default values. Bindings that generate their stubs often name a
+  private alias in signatures, such as a union spelling out the types that
+  implicitly convert to a parameter; this hook rewrites such a reference as
+  the type a reader expects. The default keeps annotations unchanged.
 - ``style``: the docstring markup convention. ``'google'`` (the default)
   and ``'numpy'`` run Sphinx's napoleon parser, while ``'rst'`` passes
   docstrings through untouched.
@@ -133,7 +142,8 @@ renders the set as a list of aligned lines for reporting.
 
    partition(names: Iterable[str], sections: dict[str, list[str]],
              other: str | None = None,
-             key: Callable[[str], str] = str.lower) -> Iterator[tuple[str, list[str]]]
+             key: Callable[[str], str] = str.lower,
+             warn: Callable[[str], None] | None = None) -> Iterator[tuple[str, list[str]]]
 
 This function distributes names over a sections table and yields
 ``(title, matched names)`` pairs in table order.
@@ -145,8 +155,18 @@ This function distributes names over a sections table and yields
   Without it, unmatched names are dropped.
 - ``key``: the sort key applied within each group, case-insensitive by
   default.
+- ``warn``: a reporting hook that receives one message per anomaly in the
+  table, ahead of the first group: a pattern that matches nothing, a pair of
+  sections that claim the same name, and, unless ``other`` collects them, a
+  name that no section claims and that is therefore dropped.
 
 Sections that match nothing are omitted.
+
+The three warnings are advisory rather than errors. A table often outlives
+the build it was written against, where an optional feature adds or removes
+names, and breaking a tie through the section order is a documented liberty.
+In a table that draws no warnings, each name lands in its section no matter
+how the entries are ordered.
 
 ``find_stub_dir()``
 -------------------
@@ -209,13 +229,17 @@ and ``generate()`` route their output through it.
 
 .. code-block:: python
 
-   toctree(title: str, slugs: Iterable[str], prefix: str = '') -> str
+   toctree(title: str | None, slugs: Iterable[str], prefix: str = '',
+           hidden: bool = False) -> str
 
-This function returns a section with a ``toctree`` of the given page slugs,
-for drivers that emit their own linking structure. ``prefix`` is prepended
-to every entry, and a prefix starting with ``/`` resolves the entries
-against the documentation root, which leaves the including page free to
-live anywhere.
+This function returns a ``toctree`` of the given page slugs, for drivers
+that emit their own linking structure. A ``title`` puts the tree under a
+section heading, and ``prefix`` is prepended to every entry, where a prefix
+starting with ``/`` resolves the entries against the documentation root,
+which leaves the including page free to live anywhere. A ``hidden`` toctree
+lists nothing and only tells Sphinx that the pages belong to the
+documentation, which suits an internal module that exists so that
+references to it resolve.
 
 ``generate()``
 --------------
@@ -224,12 +248,13 @@ live anywhere.
 
    generate(stub_dir: str, out_dir: str, package: str,
             renderer: Renderer | None = None,
-            sections: dict[str, list[str]] | None = None) -> list[str]
+            sections: dict[str, list[str]] | None = None,
+            warn: Callable[[str], None] | None = None) -> list[str]
 
 ``generate()`` runs the complete pipeline that the extension and the
 command line use: it writes one alphabetical page per module plus an
 ``index.rst`` that links them, and returns the page slugs in index order.
-A custom ``renderer`` substitutes rendering policy, and a ``sections``
-table splits the top-level module thematically as described above. Drivers
-whose page layout goes beyond the sections mechanism skip this function and
-combine the pieces above instead.
+A custom ``renderer`` substitutes rendering policy, a ``sections`` table
+splits the top-level module thematically as described above, and ``warn``
+reports anomalies in that table. Drivers whose page layout goes beyond the
+sections mechanism skip this function and combine the pieces above instead.

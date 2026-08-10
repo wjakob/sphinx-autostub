@@ -46,10 +46,10 @@ autostub_sections = {                  # split the top-level module thematically
 ```
 
 A sections table groups the top-level module's contents into one page per
-entry, in table order. Each name joins the first section with a matching
-regex, leftovers land on an 'Other' page, and the submodules keep one page
-each. All settings are plain data on purpose: Sphinx pickles configuration
-values into its build environment, so every setting has to survive `pickle`.
+entry, in table order. Each name joins the first section with a matching regex,
+leftovers land on an 'Other' page, and the submodules keep one page each. A
+pattern that matches nothing, and a name that several sections claim, are
+reported as build warnings.
 
 The page-per-module layout is also available from the command line:
 

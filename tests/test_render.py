@@ -1,7 +1,8 @@
 import sys
 
 from sphinx_autostub import (Renderer, format_param_mismatches,
-                                      generate, partition, walk_stubs)
+                                      generate, partition, toctree,
+                                      walk_stubs)
 
 STUB = '''\
 """A small example module."""
@@ -83,8 +84,9 @@ def test_class_rendering(tmp_path):
     assert lines[i + 1] == '      :no-index:'
     assert '   .. py:method:: Button.resize(extent: float) -> float' in lines
     assert text.count(':no-index:') == 1
-    # Property without the setter, attribute with its docstring
+    # Property without the setter, carrying the type its signature would drop
     assert '.. py:property:: Button.label' in text
+    assert ':type: Label' in text
     assert '.. py:method:: Button.label' not in text
     assert '.. py:attribute:: Button.padding' in text
     assert ':type: float' in text
@@ -187,7 +189,7 @@ class Outer:
     def __eq__(self, arg: object, /) -> bool: ...
 
 class Fancy(Outer):
-    pass
+    """A derived class."""
 
 Alias: TypeAlias = Outer
 
@@ -218,7 +220,9 @@ def test_rich_class_features(tmp_path):
     # Dunder methods survive the underscore exclusion rule
     assert '.. py:method:: Outer.__eq__(arg: object, /) -> bool' in outer
 
-    assert 'Bases: :py:obj:`Outer`' in '\n'.join(entries['Fancy'])
+    fancy = '\n'.join(entries['Fancy'])
+    assert 'Bases: :py:obj:`Outer`' in fancy
+    assert fancy.index('Bases:') < fancy.index('A derived class.')
     assert 'Type alias for ``Outer``' in '\n'.join(entries['Alias'])
     limit = '\n'.join(entries['LIMIT'])
     assert '.. py:data:: LIMIT' in limit and ':type: int' in limit
@@ -261,6 +265,56 @@ def test_partition_first_match_wins():
     assert list(partition(['x', 'y'], table)) == [('A', ['x']), ('B', ['y'])]
     # Without 'other', unmatched names are dropped
     assert list(partition(['z'], table)) == []
+
+
+def test_partition_warnings():
+    """warn() reports the three ways a table can disagree with the names it
+    distributes, without changing what partition() yields."""
+    table = {'A': ['x', 'y', 'nomatch'], 'B': [r'\w']}
+    msgs = []
+    assert list(partition(['x', 'y', 'zz'], table, warn=msgs.append)) == [
+        ('A', ['x', 'y'])]
+    # 'B' overlaps 'A' in both names, which costs one message rather than two
+    assert set(msgs) == {
+        "'x' belongs to section 'A' and also matches 'B'",
+        "section 'A': pattern 'nomatch' matches nothing",
+        "'zz' matches no section and is dropped"}
+    # An 'other' group is where unmatched names are meant to go
+    msgs.clear()
+    list(partition(['y', 'zz'], {'B': [r'\w']}, other='Other',
+                   warn=msgs.append))
+    assert msgs == []
+
+
+def test_annotation_filter(tmp_path):
+    """annotation_filter rewrites every rendered type expression, and nothing
+    else: parameter names and default values are out of its reach."""
+    path = tmp_path / 'ann.pyi'
+    path.write_text('from typing import TypeAlias\n'
+                    'class C:\n'
+                    '    field: _IntC\n'
+                    '    @property\n'
+                    '    def size(self) -> _IntC: ...\n'
+                    '    def at(self, _IntC: _IntC = _IntC) -> "_IntC": ...\n'
+                    'Alias: TypeAlias = _IntC\n'
+                    'LIMIT: _IntC\n')
+    _, entries = Renderer(
+        annotation_filter=lambda a: a.replace('_IntC', 'int')).collect(path)
+    text = '\n'.join(entries['C'])
+    assert ':type: int' in text and ':type: _IntC' not in text
+    assert '.. py:method:: C.at(_IntC: int=_IntC) -> int' in text
+    assert 'Type alias for ``int``' in '\n'.join(entries['Alias'])
+    assert ':type: int' in '\n'.join(entries['LIMIT'])
+
+
+def test_toctree():
+    """A toctree carries an optional caption, and a hidden one registers its
+    pages without listing them."""
+    assert toctree('Pages', ['a', 'b'], prefix='/api/') == (
+        'Pages\n-----\n\n.. toctree::\n    :maxdepth: 1\n\n'
+        '    /api/a\n    /api/b\n\n')
+    assert toctree(None, ['a'], hidden=True) == (
+        '.. toctree::\n    :hidden:\n\n    a\n\n')
 
 
 def test_walk_stubs(tmp_path):

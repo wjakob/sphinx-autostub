@@ -23,7 +23,7 @@ from sphinx.ext.napoleon.docstring import GoogleDocstring, NumpyDocstring
 if TYPE_CHECKING:
     from sphinx.application import Sphinx
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 __all__ = ['Renderer', 'format_param_mismatches', 'generate', 'partition',
            'toctree', 'walk_stubs', 'write_page', 'write_text',
@@ -47,20 +47,42 @@ def _unquote_forward_refs(node: ast.AST) -> None:
                 setattr(child, field, ast.Name(id=ann.value))
 
 
-def _render_signature(fn: ast.FunctionDef) -> str:
+def _args(a: ast.arguments) -> list[ast.arg]:
+    return a.posonlyargs + a.args + a.kwonlyargs + \
+        [x for x in (a.vararg, a.kwarg) if x]
+
+
+def _render_annotation(node: ast.AST,
+                       filt: Callable[[str], str] | None) -> str:
+    """Render a type expression, passing it through ``filt`` if given."""
+    text = ast.unparse(node)
+    return filt(text) if filt else text
+
+
+def _render_signature(fn: ast.FunctionDef,
+                      filt: Callable[[str], str] | None = None) -> str:
     """Reconstruct a Python signature string from a stub function definition.
 
     This rewrites ``fn`` in place, so render each definition once.
     """
     _unquote_forward_refs(fn)
+    a = fn.args
+    # Each annotation goes through the filter on its own, which keeps it away
+    # from parameter names and default values. The rendered text goes back as
+    # a bare 'Name', which 'ast.unparse' emits verbatim.
+    for arg in _args(a):
+        if arg.annotation is not None:
+            arg.annotation = ast.Name(id=_render_annotation(arg.annotation,
+                                                            filt))
     # Sphinx leaves 'self' and 'cls' implicit. Dropping the leading argument
     # keeps the rest aligned with 'defaults', which pairs with the trailing
     # ones.
-    for group in (fn.args.posonlyargs, fn.args.args):
+    for group in (a.posonlyargs, a.args):
         if group and group[0].arg in ('self', 'cls'):
             del group[0]
             break
-    return '(%s)%s' % (ast.unparse(fn.args), ' -> ' + ast.unparse(fn.returns)
+    return '(%s)%s' % (ast.unparse(a),
+                       ' -> ' + _render_annotation(fn.returns, filt)
                        if fn.returns is not None else '')
 
 
@@ -120,6 +142,9 @@ class Renderer:
             an underscore. Dunder methods are always kept.
         docstring_filter: Transformation applied to each raw docstring before
             markup conversion.
+        annotation_filter: Transformation applied to each type expression
+            before it is rendered, e.g. to resolve a private alias that the
+            stubs use to spell out implicit conversions.
         style: Docstring markup convention, one of 'google', 'numpy', or 'rst'
             for docstrings that already are reStructuredText.
     """
@@ -128,6 +153,7 @@ class Renderer:
                  exclude: str | Iterable[str] | Callable[[str], bool] |
                  None = None,
                  docstring_filter: Callable[[str], str] | None = None,
+                 annotation_filter: Callable[[str], str] | None = None,
                  style: str = 'google') -> None:
         if exclude is None:
             self.exclude: Callable[[str], bool] = _default_exclude
@@ -138,6 +164,7 @@ class Renderer:
             self.exclude = lambda name: any(
                 re.fullmatch(p, name) for p in patterns)
         self.docstring_filter = docstring_filter
+        self.annotation_filter = annotation_filter
         self.style = style
         # Parameters documented under 'Args:' that the stub does not accept,
         # as (qualname, parameter, accepted parameters) tuples. Usually a stale
@@ -158,9 +185,7 @@ class Renderer:
 
     def _check_params(self, fn: ast.FunctionDef, qualname: str,
                       doc: list[str]) -> None:
-        a = fn.args
-        accepted = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
-        accepted |= {x.arg for x in (a.vararg, a.kwarg) if x}
+        accepted = {x.arg for x in _args(fn.args)}
         # '_emit_function' drops 'self' wherever it renders a signature, which
         # leaves a property's intact.
         for name in re.findall(r'^:param (\w+):', '\n'.join(doc), re.M):
@@ -178,12 +203,19 @@ class Renderer:
 
         header = '%s.. py:%s:: %s%s' % (
             indent, kind, qualname,
-            '' if kind == 'property' else _render_signature(fn))
+            '' if kind == 'property'
+            else _render_signature(fn, self.annotation_filter))
+        out = [header]
         if qualname in seen or not owner:
-            out = [header, indent + '   :no-index:', '']
+            out.append(indent + '   :no-index:')
         else:
-            out = [header, '']
             seen.add(qualname)
+        # A property renders no signature, so its type would otherwise be lost.
+        if kind == 'property' and fn.returns is not None:
+            _unquote_forward_refs(fn)
+            out.append('%s   :type: %s' % (indent, _render_annotation(
+                fn.returns, self.annotation_filter)))
+        out.append('')
 
         doc = self.convert_docstring(ast.get_docstring(fn))
         self._check_params(fn, qualname, doc)
@@ -200,14 +232,15 @@ class Renderer:
             out += _section(qualname)
         out += ['%s.. py:class:: %s' % (ind, qualname), '']
 
-        out += _rst_block(self.convert_docstring(ast.get_docstring(cls)),
-                          ind + '   ')
-
+        # The base classes belong next to the signature, ahead of the prose.
         bases = [b for b in map(ast.unparse, cls.bases)
                  if not b.startswith(('Generic', 'enum.'))]
         if bases:
             out += ['%s   Bases: %s' % (ind, ', '.join(
                 ':py:obj:`%s`' % b.split('[')[0] for b in bases)), '']
+
+        out += _rst_block(self.convert_docstring(ast.get_docstring(cls)),
+                          ind + '   ')
 
         def emit_attribute(name: str, option: str,
                            doc: str | None) -> list[str]:
@@ -242,7 +275,9 @@ class Renderer:
             elif (isinstance(node, ast.AnnAssign) and
                     isinstance(node.target, ast.Name)):
                 out += emit_attribute(
-                    node.target.id, ':type: %s' % ast.unparse(node.annotation),
+                    node.target.id,
+                    ':type: %s' % _render_annotation(node.annotation,
+                                                     self.annotation_filter),
                     _attr_doc(body, i))
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
@@ -280,9 +315,16 @@ class Renderer:
                 name = node.target.id
                 if self.exclude(name):
                     continue
-                ann = ast.unparse(node.annotation)
+                ann = _render_annotation(node.annotation,
+                                         self.annotation_filter)
                 if 'TypeAlias' in ann:
-                    target = ast.unparse(node.value) if node.value else ann
+                    target = _render_annotation(
+                        node.value, self.annotation_filter) \
+                        if node.value else ann
+                    # Not '.. py:type::': a type alias appears in annotations,
+                    # which Sphinx resolves with the 'py:class' role. That role
+                    # does not match objects registered by 'py:type', so the
+                    # references would all break.
                     body = ['.. py:class:: %s' % name, '',
                             '   Type alias for ``%s``.' % target, '']
                 else:
@@ -327,16 +369,19 @@ def write_page(out_dir: str | os.PathLike[str], slug: str, title: str,
     return slug
 
 
-def toctree(title: str, slugs: Iterable[str], prefix: str = '') -> str:
-    """Return a section with a toctree of the given pages.
+def toctree(title: str | None, slugs: Iterable[str], prefix: str = '',
+            hidden: bool = False) -> str:
+    """Return a toctree of the given pages, under an optional section title.
 
     A ``prefix`` starting with '/' makes the entries resolve against the
     documentation root, which leaves the page including this file free to
-    live anywhere.
+    live anywhere. A ``hidden`` toctree registers its pages without listing
+    them, for pages that exist only so that references to them resolve.
     """
-    return ('%s\n%s\n\n.. toctree::\n    :maxdepth: 1\n\n' %
-            (title, '-' * len(title)) +
-            ''.join('    %s%s\n' % (prefix, s) for s in slugs) + '\n')
+    text = '%s\n%s\n\n' % (title, '-' * len(title)) if title else ''
+    text += '.. toctree::\n    %s\n\n' % (
+        ':hidden:' if hidden else ':maxdepth: 1')
+    return text + ''.join('    %s%s\n' % (prefix, s) for s in slugs) + '\n'
 
 
 def find_stub_dir(package: str,
@@ -363,7 +408,8 @@ def find_stub_dir(package: str,
 
 def partition(names: Iterable[str], sections: Mapping[str, Sequence[str]],
               other: str | None = None,
-              key: Callable[[str], str] = str.lower
+              key: Callable[[str], str] = str.lower,
+              warn: Callable[[str], None] | None = None
               ) -> Iterator[tuple[str, list[str]]]:
     """Group names by an ordered ``{title: [regex, ...]}`` table.
 
@@ -371,17 +417,44 @@ def partition(names: Iterable[str], sections: Mapping[str, Sequence[str]],
     section with a full-match pattern; each group is sorted by ``key``, and
     empty groups are dropped. With ``other``, names that match nothing form a
     final group of that title.
+
+    ``warn`` receives one message per anomaly in the table, ahead of the first
+    group: a pattern that matches nothing, a pair of sections that claim the
+    same name, and, unless ``other`` collects them, a name that no section
+    claims and that is therefore dropped. All three are advisory, since a table
+    may legitimately span several builds of a package, and relying on the
+    section order to break a tie is a documented liberty.
     """
     names = list(names)
-    assigned: set[str] = set()
+    owner: dict[str, str] = {}
+    overlaps: set[tuple[str, str]] = set()
     for title, patterns in sections.items():
-        matched = sorted(
-            (n for n in names if n not in assigned and
-             any(re.fullmatch(p, n) for p in patterns)), key=key)
+        for name in names:
+            if not any(re.fullmatch(p, name) for p in patterns):
+                continue
+            if name not in owner:
+                owner[name] = title
+            # One example per pair of sections: a broad trailing section would
+            # otherwise report every name ahead of it.
+            elif warn and (owner[name], title) not in overlaps:
+                overlaps.add((owner[name], title))
+                warn('%r belongs to section %r and also matches %r'
+                     % (name, owner[name], title))
+    if warn:
+        for title, patterns in sections.items():
+            for p in patterns:
+                if not any(re.fullmatch(p, n) for n in names):
+                    warn('section %r: pattern %r matches nothing'
+                         % (title, p))
+        if other is None:
+            for name in names:
+                if name not in owner:
+                    warn('%r matches no section and is dropped' % name)
+    for title in sections:
+        matched = sorted((n for n, t in owner.items() if t == title), key=key)
         if matched:
-            assigned.update(matched)
             yield title, matched
-    rest = sorted((n for n in names if n not in assigned), key=key)
+    rest = sorted((n for n in names if n not in owner), key=key)
     if other is not None and rest:
         yield other, rest
 
@@ -406,13 +479,15 @@ def walk_stubs(stub_dir: str | os.PathLike[str],
 def generate(stub_dir: str | os.PathLike[str],
              out_dir: str | os.PathLike[str], package: str,
              renderer: Renderer | None = None,
-             sections: Mapping[str, Sequence[str]] | None = None) -> list[str]:
+             sections: Mapping[str, Sequence[str]] | None = None,
+             warn: Callable[[str], None] | None = None) -> list[str]:
     """Render one page per stub module, plus an ``index.rst`` linking them.
 
     Modules and their entries are laid out alphabetically. With ``sections``,
     the top-level module is instead split into one page per :func:`partition`
     group, leftovers land on an 'Other' page, and the module docstring moves
-    to the index. Returns the page slugs in index order.
+    to the index. Returns the page slugs in index order. ``warn`` reports
+    anomalies in the sections table, as described for :func:`partition`.
     """
     renderer = renderer or Renderer()
     front: list[str] = []
@@ -424,7 +499,8 @@ def generate(stub_dir: str | os.PathLike[str],
             continue
         if module == package and sections:
             index_intro = intro
-            for title, names in partition(entries, sections, other='Other'):
+            for title, names in partition(entries, sections, other='Other',
+                                          warn=warn):
                 slug = '%s_%s' % (package.replace('.', '_'),
                                   re.sub(r'\W+', '_', title.lower()))
                 front.append(write_page(out_dir, slug, title,
@@ -442,8 +518,7 @@ def generate(stub_dir: str | os.PathLike[str],
     text = '%s\n%s\n\n' % (title, '=' * len(title))
     if index_intro:
         text += '\n'.join(index_intro).strip() + '\n\n'
-    text += '.. toctree::\n    :maxdepth: 1\n\n'
-    text += ''.join('    %s\n' % s for s in slugs) + '\n'
+    text += toctree(None, slugs)
     write_text(os.path.join(out_dir, 'index.rst'), text)
     return slugs
 
@@ -468,7 +543,8 @@ def _builder_inited(app: Sphinx) -> None:
         out_dir = os.path.join(app.srcdir, cfg.autostub_output,
                                package.replace('.', '_'))
         generate(stub_dir, out_dir, package, renderer=renderer,
-                 sections=cfg.autostub_sections or None)
+                 sections=cfg.autostub_sections or None,
+                 warn=lambda msg: logger.warning('%s', msg))
 
     for qualname, name, accepted in sorted(renderer.param_mismatches):
         logger.warning('%s documents a parameter %r that its stub does not '
